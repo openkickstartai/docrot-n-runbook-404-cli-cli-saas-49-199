@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "docrot"
+version = "0.1.0"
+description = "Documentation Rot Detection Engine — find stale docs before they cause incidents"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+keywords = ["documentation", "linter", "stale-docs", "devtools"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Quality Assurance",
+    "License :: OSI Approved :: MIT License",
+]
+
+[project.scripts]
+docrot = "docrot:main"
+
+[tool.pytest.ini_options]
+testpaths = ["."]
