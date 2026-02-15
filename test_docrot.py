@@ -2,7 +2,8 @@
 import json
 import pytest
 from pathlib import Path
-from docrot import scan_doc, scan_repo, fmt, to_sarif, ScanResult
+from docrot import scan_doc, scan_repo, fmt, to_sarif, ScanResult, CliCommandDetector
+
 
 
 @pytest.fixture
@@ -108,3 +109,103 @@ def test_external_link_skipped_by_default(repo):
     doc.write_text("See [Google](https://google.com) for info.\n")
     issues = scan_doc(doc, repo, check_urls=False)
     assert len(issues) == 0
+
+
+# --- CLI Flag/Command Staleness Detection Tests ---
+
+
+@pytest.fixture
+def cli_repo(tmp_path):
+    """Repo with .docrot-cli.yml config for CLI flag detection tests."""
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "helpers.py").write_text("def greet(): pass\n")
+    config = (
+        "commands:\n"
+        "  docrot:\n"
+        "    flags: [--format, --output, --config, --verbose, -v]\n"
+        "    deprecated: [--legacy-mode]\n"
+        "  myapp:\n"
+        "    flags: [--port, --host, --debug]\n"
+    )
+    (tmp_path / ".docrot-cli.yml").write_text(config)
+    return tmp_path
+
+
+def test_cli_valid_flags_no_issue(cli_repo):
+    """Known valid flags should not produce any issues."""
+    doc = cli_repo / "docs" / "usage.md"
+    doc.write_text("Run:\n```bash\ndocrot . --format json --verbose\n```\n")
+    detector = CliCommandDetector(cli_repo)
+    issues = detector.detect(doc)
+    assert len(issues) == 0
+
+
+def test_cli_unknown_flag_reported(cli_repo):
+    """A flag not listed in config should be reported as CLI_FLAG_UNKNOWN."""
+    doc = cli_repo / "docs" / "usage.md"
+    doc.write_text("Run:\n```bash\ndocrot . --unknown-flag\n```\n")
+    detector = CliCommandDetector(cli_repo)
+    issues = detector.detect(doc)
+    assert len(issues) == 1
+    assert issues[0].kind == "CLI_FLAG_UNKNOWN"
+    assert "--unknown-flag" in issues[0].message
+    assert "docrot" in issues[0].message
+
+
+def test_cli_deprecated_flag_reported(cli_repo):
+    """A deprecated flag should be reported as CLI_FLAG_DEPRECATED."""
+    doc = cli_repo / "docs" / "usage.md"
+    doc.write_text("Run:\n```bash\ndocrot . --legacy-mode\n```\n")
+    detector = CliCommandDetector(cli_repo)
+    issues = detector.detect(doc)
+    assert len(issues) == 1
+    assert issues[0].kind == "CLI_FLAG_DEPRECATED"
+    assert "--legacy-mode" in issues[0].message
+    assert "docrot" in issues[0].message
+
+
+def test_cli_no_config_silent_skip(tmp_path):
+    """Without .docrot-cli.yml, detector returns empty list (no crash)."""
+    (tmp_path / "docs").mkdir()
+    doc = tmp_path / "docs" / "usage.md"
+    doc.write_text("Run:\n```bash\ndocrot . --anything --whatever\n```\n")
+    detector = CliCommandDetector(tmp_path)
+    assert detector.commands is None
+    issues = detector.detect(doc)
+    assert len(issues) == 0
+
+
+def test_cli_non_shell_block_skipped(cli_repo):
+    """Non-shell code blocks (e.g. python) should not trigger CLI checks."""
+    doc = cli_repo / "docs" / "usage.md"
+    doc.write_text(
+        "Example:\n```python\nparser.add_argument('--unknown-flag')\n```\n"
+    )
+    detector = CliCommandDetector(cli_repo)
+    issues = detector.detect(doc)
+    assert len(issues) == 0
+
+
+def test_cli_prompt_prefix_parsed(cli_repo):
+    """Shell prompt prefixes ($ and >) should be stripped before parsing."""
+    doc = cli_repo / "docs" / "usage.md"
+    doc.write_text(
+        "Run:\n```bash\n$ docrot . --format json\n$ docrot . --bad-opt\n```\n"
+    )
+    detector = CliCommandDetector(cli_repo)
+    issues = detector.detect(doc)
+    assert len(issues) == 1
+    assert issues[0].kind == "CLI_FLAG_UNKNOWN"
+    assert "--bad-opt" in issues[0].message
+
+
+def test_cli_unlabeled_block_with_prompt(cli_repo):
+    """Unlabeled code block with $ prefix should be treated as shell."""
+    doc = cli_repo / "docs" / "usage.md"
+    doc.write_text("Run:\n```\n$ docrot . --nope\n```\n")
+    detector = CliCommandDetector(cli_repo)
+    issues = detector.detect(doc)
+    assert len(issues) == 1
+    assert issues[0].kind == "CLI_FLAG_UNKNOWN"
+    assert "--nope" in issues[0].message
