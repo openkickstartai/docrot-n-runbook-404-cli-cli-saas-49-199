@@ -126,3 +126,152 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
+
+
+# --- CLI Command/Flag Staleness Detection ---
+
+SHELL_LANGS = {'bash', 'shell', 'sh', 'console', 'zsh'}
+CLI_FLAG_RE = re.compile(r'(--[a-zA-Z][\w-]*|-[a-zA-Z])\b')
+FENCE_LANG_RE = re.compile(r'^```(\w*)')
+
+
+def _parse_yaml_list(s):
+    """Parse a YAML inline list like [--flag1, --flag2]."""
+    s = s.strip()
+    if s.startswith('[') and s.endswith(']'):
+        return [item.strip() for item in s[1:-1].split(',') if item.strip()]
+    return []
+
+
+def _parse_cli_config(config_path):
+    """Minimal YAML parser for .docrot-cli.yml (no PyYAML dependency)."""
+    text = Path(config_path).read_text(errors='replace')
+    commands = {}
+    current_cmd = None
+    cmd_indent = 0
+    in_commands = False
+    commands_indent = -1
+
+    for line in text.split('\n'):
+        if not line.strip() or line.strip().startswith('#'):
+            continue
+        indent = len(line) - len(line.lstrip())
+        stripped = line.strip()
+
+        if stripped == 'commands:':
+            in_commands = True
+            commands_indent = indent
+            continue
+
+        if not in_commands:
+            continue
+
+        if indent <= commands_indent:
+            break
+
+        if stripped.endswith(':') and not stripped.startswith(('flags:', 'deprecated:')):
+            current_cmd = stripped[:-1].strip()
+            cmd_indent = indent
+            commands[current_cmd] = {'flags': [], 'deprecated': []}
+            continue
+
+        if current_cmd is not None and indent > cmd_indent:
+            if stripped.startswith('flags:'):
+                commands[current_cmd]['flags'] = _parse_yaml_list(
+                    stripped[len('flags:'):])
+            elif stripped.startswith('deprecated:'):
+                commands[current_cmd]['deprecated'] = _parse_yaml_list(
+                    stripped[len('deprecated:'):])
+
+    return commands
+
+
+class CliCommandDetector:
+    """Detect stale/unknown/deprecated CLI flags in Markdown documentation."""
+
+    def __init__(self, root):
+        self.root = Path(root)
+        self.commands = None
+        config_path = self.root / '.docrot-cli.yml'
+        if config_path.exists():
+            self.commands = _parse_cli_config(config_path)
+
+    def detect(self, doc_path, text=None):
+        """Scan a document for CLI flag issues. Returns list of Issue."""
+        if self.commands is None:
+            return []
+        if text is None:
+            text = Path(doc_path).read_text(errors='replace')
+        try:
+            rel = str(Path(doc_path).relative_to(self.root))
+        except ValueError:
+            rel = str(doc_path)
+
+        issues = []
+        in_block = False
+        block_lang = ''
+        block_lines = []
+
+        for i, line in enumerate(text.split('\n'), 1):
+            if line.startswith('```'):
+                if in_block:
+                    if self._is_shell_block(block_lang, block_lines):
+                        issues.extend(self._check_block(rel, block_lines))
+                    in_block = False
+                    block_lines = []
+                    block_lang = ''
+                else:
+                    in_block = True
+                    m = FENCE_LANG_RE.match(line)
+                    block_lang = m.group(1) if m else ''
+                    block_lines = []
+            elif in_block:
+                block_lines.append((i, line))
+        return issues
+
+    def _is_shell_block(self, lang, lines):
+        """Determine if a code block is a shell block."""
+        if lang.lower() in SHELL_LANGS:
+            return True
+        if lang == '':
+            return any(
+                ln.strip().startswith('$') or ln.strip().startswith('>')
+                for _, ln in lines
+            )
+        return False
+
+    def _check_block(self, rel, lines):
+        """Check all lines in a shell block for flag issues."""
+        issues = []
+        for line_no, content in lines:
+            cmd_line = re.sub(r'^\s*[$>]\s*', '', content).strip()
+            if not cmd_line or cmd_line.startswith('#'):
+                continue
+            # Split on pipes and logical operators to avoid false positives
+            for segment in re.split(r'\|{1,2}|&&|;', cmd_line):
+                segment = segment.strip()
+                if not segment:
+                    continue
+                parts = segment.split()
+                cmd_name = parts[0].split('/')[-1] if parts else None
+                if cmd_name not in self.commands:
+                    continue
+                cfg = self.commands[cmd_name]
+                valid = set(cfg.get('flags', []))
+                deprecated = set(cfg.get('deprecated', []))
+                for fm in CLI_FLAG_RE.finditer(segment):
+                    flag = fm.group(1)
+                    if flag in deprecated:
+                        issues.append(Issue(
+                            rel, line_no, "CLI_FLAG_DEPRECATED",
+                            f"Deprecated CLI flag '{flag}' for command '{cmd_name}'"))
+                    elif flag not in valid:
+                        issues.append(Issue(
+                            rel, line_no, "CLI_FLAG_UNKNOWN",
+                            f"Unknown CLI flag '{flag}' for command '{cmd_name}'"))
+        return issues
+
+
+def detect_cli_issues(doc_path, root):
+    """Convenience function: detect CLI flag issues in a single document."""
+    return CliCommandDetector(root).detect(doc_path)
